@@ -49,7 +49,7 @@ async function resolveInput(input) {
     // 1. Remote HTTP/HTTPS URL
     if (/^https?:\/\//i.test(input)) {
       validateSafeUrl(input);
-      const res = await fetch(input);
+      const res = await fetch(input, { signal: AbortSignal.timeout(10000) });
       if (!res.ok) {
         throw new ZapwebpError({
           code: 'E_REMOTE_FETCH_FAILED',
@@ -58,7 +58,36 @@ async function resolveInput(input) {
           retryable: res.status >= 500,
         });
       }
-      const arrayBuf = await res.arrayBuffer();
+      const maxAllowed = 16 * 1024 * 1024;
+      let arrayBuf;
+      if (!res.body) {
+        arrayBuf = await res.arrayBuffer();
+      } else {
+        const reader = res.body.getReader();
+        const chunks = [];
+        let received = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          received += value.byteLength;
+          if (received > maxAllowed) {
+            await reader.cancel('Max bytes exceeded');
+            throw new ZapwebpError({
+              code: 'E_TOO_LARGE',
+              message: `Remote image at "${input}" exceeds maximum allowed size of ${maxAllowed} bytes.`,
+              fix: 'Provide an image under 16MB.',
+            });
+          }
+          chunks.push(value);
+        }
+        const total = new Uint8Array(received);
+        let pos = 0;
+        for (const c of chunks) {
+          total.set(c, pos);
+          pos += c.byteLength;
+        }
+        arrayBuf = total.buffer;
+      }
       const urlPath = new URL(input).pathname;
       return { buffer: Buffer.from(arrayBuf), filename: path.basename(urlPath) || 'image.bin' };
     }
@@ -139,6 +168,46 @@ class Zapwebp {
       options = maybeOptions;
     }
 
+    if (options.deleteOriginal) {
+      if (typeof rawInput !== 'string') {
+        throw new ZapwebpError({
+          code: 'E_DELETE_INVALID_TARGET',
+          message: 'deleteOriginal option is only valid when input is a file path string.',
+          fix: 'Pass a filesystem path string as the input when requesting deleteOriginal.',
+        });
+      }
+
+      let isAllowed = Boolean(options.allowDeleteOriginal);
+      if (!isAllowed) {
+        try {
+          const fsSync = require('node:fs');
+          const configCandidates = [
+            path.resolve('.zapwebp', 'config.json'),
+            path.resolve('.zapwebp.config.json'),
+            path.resolve('zapwebp.config.json'),
+            path.resolve('.zapwebp.json'),
+          ];
+          for (const cf of configCandidates) {
+            if (fsSync.existsSync(cf)) {
+              const parsed = JSON.parse(fsSync.readFileSync(cf, 'utf8'));
+              if (parsed.allowDeleteOriginal === true) {
+                isAllowed = true;
+                break;
+              }
+            }
+          }
+        } catch {}
+      }
+
+      if (!isAllowed) {
+        throw new ZapwebpError({
+          code: 'E_DELETE_NOT_ENABLED',
+          message: 'Original file deletion requires explicit opt-in. Set allowDeleteOriginal: true in options or in .zapwebp/config.json.',
+          fix: 'Pass allowDeleteOriginal: true in SDK convert options or configure .zapwebp/config.json.',
+        });
+      }
+    }
+
     const { buffer } = await resolveInput(rawInput);
     const targets = Array.isArray(options.to) ? options.to : null;
 
@@ -191,6 +260,31 @@ class Zapwebp {
         reason: 'Verify the output has no residual metadata remaining.',
       };
 
+      if (options.deleteOriginal && typeof rawInput === 'string') {
+        const resolvedInputPath = path.resolve(rawInput);
+        const inputBytes = await fs.readFile(resolvedInputPath);
+        const inputHash = crypto.createHash('sha256').update(inputBytes).digest('hex');
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        const backupDir = path.resolve('.zapwebp', 'backups', ts);
+        const backupPath = path.join(backupDir, path.basename(resolvedInputPath));
+
+        await fs.mkdir(backupDir, { recursive: true });
+        await fs.writeFile(backupPath, inputBytes);
+
+        const written = await fs.readFile(backupPath);
+        const writtenHash = crypto.createHash('sha256').update(written).digest('hex');
+        if (writtenHash !== inputHash) {
+          throw new ZapwebpError({
+            code: 'E_BACKUP_VERIFICATION_FAILED',
+            message: `Backup verification failed for ${path.basename(resolvedInputPath)}. Original file was not deleted.`,
+          });
+        }
+
+        await fs.unlink(resolvedInputPath);
+        outBuf.originalDeleted = true;
+        outBuf.backupPath = backupPath;
+      }
+
       return outBuf;
     }
 
@@ -219,6 +313,7 @@ class Zapwebp {
       method: 'POST',
       body: formData,
       headers,
+      signal: AbortSignal.timeout(10000),
     });
 
     if (!res.ok) {
@@ -597,7 +692,7 @@ class Zapwebp {
 
     const headers = {};
     if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
-    const res = await fetch(`${this.baseUrl}/usage`, { headers }).catch(() => null);
+    const res = await fetch(`${this.baseUrl}/usage`, { headers, signal: AbortSignal.timeout(10000) }).catch(() => null);
     if (!res || !res.ok) {
       return {
         mode: 'remote',
